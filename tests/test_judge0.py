@@ -3,7 +3,7 @@ import base64
 import pytest
 import requests
 
-from app.services.judge0 import Judge0Client, Judge0Error
+from app.services.judge0 import Judge0Client, Judge0Error, decoded_output
 
 
 class Response:
@@ -96,3 +96,39 @@ def test_private_output_is_not_requested_for_grading(monkeypatch, executor):
     executor.get_batch(["one"], include_output=True)
     assert seen[0] == "token,status,time,memory"
     assert "stdout" in seen[1]
+
+
+@pytest.mark.parametrize("encoded", [
+    "aGVsbG8sIEp1ZGdlMAo=",
+    "aGVsbG8sIEp1ZGdlMAo=\n",
+    "aGVsbG8sIEp1ZGdlMAo=\r\n",
+    " \taGVsbG8sIEp1\nZGdlMAo=\r\n",
+])
+def test_output_accepts_base64_transport_whitespace(encoded):
+    assert decoded_output(encoded) == "hello, Judge0\n"
+
+
+@pytest.mark.parametrize("line_ending", ["\n", "\r\n"])
+def test_output_preserves_unicode_and_program_line_breaks(line_ending):
+    output = "Análise de autenticação\n192.0.2.10\n" * 8
+    encoded = base64.encodebytes(output.encode("utf-8")).decode("ascii")
+    assert decoded_output(encoded.replace("\n", line_ending)) == output
+
+
+@pytest.mark.parametrize("encoded", ["!!!", "aGVsbG8sIEp1ZGdlMAo=#", "\u00a0aGVsbG8sIEp1ZGdlMAo="])
+def test_output_rejects_invalid_base64(encoded):
+    assert decoded_output(encoded) == "[Saída não disponível]"
+
+
+@pytest.mark.parametrize("value", [None, "", False, 42])
+def test_absent_output_is_empty(value):
+    assert decoded_output(value) == ""
+
+
+def test_output_keeps_its_display_limit_after_decoding():
+    encoded = base64.encodebytes(("á" * 16001).encode("utf-8")).decode("ascii")
+    assert decoded_output(encoded) == "á" * 16000
+
+
+def test_output_replaces_invalid_utf8_without_losing_the_rest():
+    assert decoded_output(base64.encodebytes(b"before\xffafter\n").decode("ascii")) == "before\ufffdafter\n"

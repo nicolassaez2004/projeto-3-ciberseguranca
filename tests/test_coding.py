@@ -1,5 +1,7 @@
 from datetime import timedelta
 
+import base64
+
 import pytest
 from bson import ObjectId
 
@@ -17,6 +19,18 @@ def start(client, identities, challenge, mode="submit", **overrides):
 def finish(client, identities, job):
     unlock()
     return client.get(f"/api/code-jobs/{job['_id']}", headers=identities["talent"]["headers"])
+
+
+def legacy_run(app, identities, assessment, stdin="example"):
+    config = mongo.db.coding_configs.find_one({"challenge_id": ObjectId(assessment)})
+    tokens = app.extensions["judge0_client"].create_batch("python", "print(0)", [{"stdin": stdin, "expected_output": None}], config)
+    job = {
+        "challenge_id": ObjectId(assessment), "talent_id": identities["talent"]["id"],
+        "mode": "run", "language": "python", "source_code": "print(0)", "max_points": 100,
+        "total": 1, "status": "processing", "active": True, "created_at": now(), "provider_tokens": tokens,
+    }
+    job["_id"] = mongo.db.coding_jobs.insert_one(job).inserted_id
+    return job
 
 
 def test_private_tests_never_appear_in_candidate_responses(client, identities, assessment):
@@ -42,29 +56,86 @@ def test_best_score_is_idempotent_and_never_added_twice(app, client, identities,
     unlock()
     app.extensions["judge0_client"].statuses = [4, 3, 3, 3, 3]
     second = finish(client, identities, start(client, identities, assessment).json["job"])
-    assert second.json["job"]["score"] == 0
+    assert second.json["job"]["score"] == 80
     assert second.json["best_score"] == 100
     assert mongo.db.coding_scores.count_documents({}) == 1
     assert mongo.db.participations.find_one({"talent_id": identities["talent"]["id"]})["status"] == "joined"
 
 
-def test_run_exposes_output_but_never_awards_points(app, client, identities, assessment):
-    created = start(client, identities, assessment, "run", stdin="example")
-    assert created.status_code == 202
+def test_existing_run_can_finish_without_awarding_points(app, client, identities, assessment):
+    job = legacy_run(app, identities, assessment)
     assert app.extensions["judge0_client"].created[0]["tests"] == [{"stdin": "example", "expected_output": None}]
-    result = finish(client, identities, created.json["job"])
+    result = finish(client, identities, job)
     assert "PRIVATE-OUTPUT" in result.json["job"]["output"]["stdout"]
     assert "score" not in result.json["job"]
     assert mongo.db.coding_scores.count_documents({}) == 0
 
 
-@pytest.mark.parametrize("statuses", [[4, 3, 3, 3, 3], [5] * 5, [6] * 5, [11] * 5])
-def test_wrong_answer_timeout_and_program_errors_get_zero(app, client, identities, assessment, statuses):
+@pytest.mark.parametrize("field,status", [("stdout", 3), ("stderr", 11), ("compile_output", 6)])
+def test_run_returns_wrapped_judge0_output_in_each_channel(app, client, identities, assessment, field, status):
+    app.extensions["judge0_client"].statuses = [status]
+    created = legacy_run(app, identities, assessment, stdin="FAIL 192.0.2.10\n")
+    output = "Saída de diagnóstico\n192.0.2.10\n" * 4
+    row = next(iter(app.extensions["judge0_client"].rows.values()))
+    row.update(stdout=None, stderr=None, compile_output=None)
+    row[field] = base64.encodebytes(output.encode("utf-8")).decode("ascii")
+    result = finish(client, identities, created)
+    assert result.status_code == 200
+    job = result.json["job"]
+    assert job["status"] == "completed"
+    assert job["output"] == {key: output if key == field else "" for key in ("stdout", "stderr", "compile_output")}
+    assert "score" not in job
+    assert mongo.db.coding_scores.count_documents({}) == 0
+
+
+@pytest.mark.parametrize("statuses,expected", [([4, 3, 3, 3, 3], 80), ([4] * 5, 0), ([5] * 5, 0), ([6] * 5, 0), ([11] * 5, 0)])
+def test_program_results_receive_proportional_points(app, client, identities, assessment, statuses, expected):
     app.extensions["judge0_client"].statuses = statuses
     job = start(client, identities, assessment).json["job"]
     result = finish(client, identities, job)
     assert result.json["job"]["status"] == "completed"
-    assert result.json["job"]["score"] == 0
+    assert result.json["job"]["score"] == expected
+
+
+@pytest.mark.parametrize("statuses,max_points,expected", [
+    ([3, 3, 3, 4, 4, 4], 100, 50),
+    ([3, 3, 3, 3, 4, 4], 100, 66.67),
+    ([3, 4, 4], 100, 33.33),
+    ([3, 3, 4], 1, 0.67),
+    ([3] + [4] * 7, 1, 0.13),
+    ([3] * 6, 250, 250),
+])
+def test_proportional_scores_use_all_cases_and_round_to_two_decimals(app, client, identities, assessment, statuses, max_points, expected):
+    mongo.db.coding_configs.update_one({"challenge_id": ObjectId(assessment)}, {"$set": {
+        "tests": [{"stdin": str(index), "expected_output": "OK"} for index in range(len(statuses))], "max_points": max_points,
+    }})
+    app.extensions["judge0_client"].statuses = statuses
+    result = finish(client, identities, start(client, identities, assessment).json["job"])
+    assert result.json["job"]["score"] == expected
+    assert result.json["best_score"] == expected
+    assert result.json["job"]["passed"] == statuses.count(3)
+    assert result.json["job"]["total"] == len(statuses)
+    score = mongo.db.coding_scores.find_one({})
+    assert ("solved_at" in score) == (expected == max_points)
+    board = client.get(f"/api/challenges/{assessment}/coding/results", headers=identities["owner"]["headers"])
+    assert board.json["results"][0]["score"] == expected
+
+
+def test_best_partial_score_survives_repeats_worse_answers_and_service_failures(app, client, identities, assessment):
+    for statuses, expected, best in [([3, 3, 4, 4, 4], 40, 40), ([3, 3, 3, 4, 4], 60, 60), ([3, 4, 4, 4, 4], 20, 60)]:
+        unlock()
+        app.extensions["judge0_client"].statuses = statuses
+        result = finish(client, identities, start(client, identities, assessment).json["job"])
+        assert result.json["job"]["score"] == expected
+        assert result.json["best_score"] == best
+        assert finish(client, identities, result.json["job"]).json["best_score"] == best
+    unlock()
+    app.extensions["judge0_client"].statuses = [3, 3, 13, 4, 4]
+    failed = finish(client, identities, start(client, identities, assessment).json["job"])
+    assert failed.json["job"]["status"] == "service_error"
+    assert "score" not in failed.json["job"]
+    assert failed.json["best_score"] == 60
+    assert mongo.db.coding_scores.count_documents({}) == 1
 
 
 def test_internal_executor_failure_is_not_a_grade(app, client, identities, assessment):
@@ -105,12 +176,36 @@ def test_permissions_prevent_cross_candidate_and_company_access(client, identiti
 
 
 def test_private_inputs_and_limits_cannot_be_supplied_by_candidate(app, client, identities, assessment):
-    created = start(client, identities, assessment, expected_output="HACK", tests=[], enable_network=True, max_points=9999, stdin="SPOOF")
+    created = start(client, identities, assessment, expected_output="HACK", tests=[], enable_network=True, max_points=9999)
     assert created.status_code == 202
     sent = app.extensions["judge0_client"].created[0]
     assert len(sent["tests"]) == 5
-    assert sent["tests"][0]["stdin"] != "SPOOF"
+    assert sent["tests"][0]["stdin"] == "FAIL\nOK\nFAIL\n"
     assert sent["limits"]["max_points"] == 100
+
+
+@pytest.mark.parametrize("payload", [{"mode": "run"}, {"stdin": "arbitrary input"}, {"stdin": ""}])
+def test_experimental_requests_cannot_create_jobs(app, client, identities, assessment, payload):
+    assert start(client, identities, assessment, **payload).status_code == 400
+    assert not app.extensions["judge0_client"].created
+    assert mongo.db.coding_jobs.count_documents({}) == 0
+
+
+def test_submission_mode_is_optional_and_defaults_to_grading(client, identities, assessment):
+    response = client.post(f"/api/challenges/{assessment}/code-jobs", headers=identities["talent"]["headers"], json={"language": "python", "source_code": "print(0)"})
+    assert response.status_code == 202
+    assert response.json["job"]["mode"] == "submit"
+
+
+def test_demo_endpoint_is_removed(client, identities):
+    assert client.post("/api/coding/demo", headers=identities["owner"]["headers"]).status_code == 404
+
+
+def test_previous_experimental_job_is_not_shown_in_the_editor(app, client, identities, assessment):
+    legacy_run(app, identities, assessment)
+    response = client.get(f"/api/challenges/{assessment}/coding", headers=identities["talent"]["headers"])
+    assert response.status_code == 200
+    assert response.json["latest_job"] is None
 
 
 def test_active_job_and_cooldown_limit_repeated_requests(app, client, identities, assessment):

@@ -1,6 +1,7 @@
 """Private test configuration, durable execution jobs and idempotent CTF scores."""
 import math
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal, ROUND_HALF_UP
 from zoneinfo import ZoneInfo
 
 from flask import current_app
@@ -140,7 +141,7 @@ def refresh_job(job):
             for i, status in enumerate(statuses)
         ])
         if claimed["mode"] == "submit":
-            values["score"] = claimed["max_points"] if passed == len(statuses) else 0
+            values["score"] = float((Decimal(claimed["max_points"]) * passed / len(statuses)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
         else:
             row = rows[0]
             values["output"] = {key: decoded_output(row.get(key)) for key in ("stdout", "stderr", "compile_output")}

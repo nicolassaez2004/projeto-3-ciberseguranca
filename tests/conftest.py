@@ -34,8 +34,8 @@ class FakeJudge0:
             token = str(uuid.uuid4())
             tokens.append(token)
             self.rows[token] = {"token": token, "status": {"id": statuses[index]},
-                "stdout": base64.b64encode(b"PRIVATE-OUTPUT").decode(),
-                "stderr": base64.b64encode(b"PRIVATE-STDERR").decode(), "compile_output": None}
+                "stdout": base64.encodebytes(b"PRIVATE-OUTPUT").decode(),
+                "stderr": base64.encodebytes(b"PRIVATE-STDERR").decode(), "compile_output": None}
         return tokens
 
     def get_batch(self, tokens, include_output=False):
@@ -76,13 +76,29 @@ def identities(app):
 
 @pytest.fixture
 def assessment(client, identities):
-    result = client.post("/api/coding/demo", headers=identities["owner"]["headers"])
+    headers = identities["owner"]["headers"]
+    result = client.post("/api/challenges", headers=headers, json={
+        "title": "Análise de eventos de autenticação", "description": "Conte os eventos FAIL.",
+        "deliverables": "Um programa Python que leia stdin e imprima a contagem.",
+        "skills": ["Python", "SOC"], "level": "Júnior", "work_mode": "Remoto", "deadline": "2099-01-01",
+    })
     assert result.status_code == 201
     challenge_id = result.json["challenge"]["_id"]
-    from bson import ObjectId
-    mongo.db.challenges.update_one({"_id": ObjectId(challenge_id)}, {"$set": {"status": "published"}})
+    config = {
+        "languages": ["python"], "max_points": 100,
+        "example": {"stdin": "OK\nFAIL\nFAIL\nOK\n", "expected_output": "2\n"},
+        "tests": [
+            {"stdin": "FAIL\nOK\nFAIL\n", "expected_output": "2\n"},
+            {"stdin": "OK\nOK\n", "expected_output": "0\n"},
+            {"stdin": "FAIL\nFAIL\nFAIL\n", "expected_output": "3\n"},
+            {"stdin": "", "expected_output": "0\n"},
+            {"stdin": "fail\nFAILED\nFAIL\nOK\n", "expected_output": "1\n"},
+        ],
+    }
+    assert client.put(f"/api/challenges/{challenge_id}/coding/config", headers=headers, json=config).status_code == 200
+    assert client.patch(f"/api/challenges/{challenge_id}/status", headers=headers, json={"action": "publish"}).status_code == 200
     for key in ["talent", "other_talent"]:
-        mongo.db.participations.insert_one({"challenge_id": ObjectId(challenge_id), "talent_id": identities[key]["id"], "status": "joined", "created_at": now()})
+        assert client.post(f"/api/challenges/{challenge_id}/join", headers=identities[key]["headers"]).status_code == 200
     return challenge_id
 
 

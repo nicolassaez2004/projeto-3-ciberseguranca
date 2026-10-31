@@ -126,6 +126,7 @@ def decoded_output(value):
     if not isinstance(value, str):
         return ""
     try:
-        return base64.b64decode(value, validate=True).decode("utf-8", "replace")[:16000]
+        encoded = re.sub(r"[ \t\r\n]+", "", value)
+        return base64.b64decode(encoded, validate=True).decode("utf-8", "replace")[:16000]
     except (ValueError, UnicodeError):
         return "[Saída não disponível]"

@@ -47,7 +47,7 @@ def coding_detail(challenge_id):
     config = mongo.db.coding_configs.find_one({"challenge_id": challenge["_id"]})
     if not config or not challenge.get("coding_enabled"):
         return api_error("Este desafio não tem avaliação por código.", 404)
-    job = mongo.db.coding_jobs.find_one({"challenge_id": challenge["_id"], "talent_id": user["_id"]}, sort=[("created_at", -1)])
+    job = mongo.db.coding_jobs.find_one({"challenge_id": challenge["_id"], "talent_id": user["_id"], "mode": "submit"}, sort=[("created_at", -1)])
     warning = ""
     if job:
         try:
@@ -107,16 +107,15 @@ def create_code_job(challenge_id):
     data = request.get_json(silent=True)
     if not isinstance(data, dict):
         return api_error("Envie o código em JSON.")
-    mode, language, source = data.get("mode"), data.get("language"), data.get("source_code")
-    if not isinstance(mode, str) or mode not in {"run", "submit"}:
-        return api_error("Escolha executar ou enviar solução.")
+    mode, language, source = data.get("mode", "submit"), data.get("language"), data.get("source_code")
+    if mode != "submit":
+        return api_error("Envie a solução para correção.")
+    if "stdin" in data:
+        return api_error("As entradas da avaliação são definidas pela empresa.")
     if not isinstance(language, str) or language not in config["languages"]:
         return api_error("Linguagem não permitida neste desafio.")
     if not isinstance(source, str) or not source.strip() or len(source.encode("utf-8")) > 64000:
         return api_error("Envie um código não vazio de até 64 KB.")
-    stdin = data.get("stdin", "")
-    if not isinstance(stdin, str) or len(stdin.encode("utf-8")) > 16000:
-        return api_error("A entrada deve ter até 16 KB.")
     client = current_app.extensions["judge0_client"]
     if not client.configured:
         raise Judge0Error("Execução indisponível. A equipe precisa configurar o Judge0 no backend.", 503)
@@ -130,8 +129,8 @@ def create_code_job(challenge_id):
         "$or": [{"coding_next_submit_at": {"$exists": False}}, {"coding_next_submit_at": {"$lte": now()}}],
     }, {"$set": {"coding_next_submit_at": now() + timedelta(seconds=3)}}, return_document=ReturnDocument.AFTER)
     if not participation:
-        return api_error("Aguarde alguns segundos antes de executar novamente.", 429)
-    tests = config["tests"] if mode == "submit" else [{"stdin": stdin, "expected_output": None}]
+        return api_error("Aguarde alguns segundos antes de enviar novamente.", 429)
+    tests = config["tests"]
     job = {
         "challenge_id": challenge["_id"], "talent_id": user["_id"], "participation_id": participation["_id"],
         "mode": mode, "language": language, "source_code": source, "max_points": config["max_points"],
@@ -199,35 +198,3 @@ def coding_results(challenge_id):
     rows.sort(key=lambda r: (-r["score"], str(r.get("solved_at") or "9999"), r["name"]))
     return jsonify(serialize({"results": rows, "warning": warning}))
 
-
-@coding_bp.post("/coding/demo")
-@jwt_required()
-def create_coding_demo():
-    user = current_user()
-    if not user or user["role"] != "company":
-        return api_error("Apenas empresas podem criar o desafio de demonstração.", 403)
-    config = validated_config({
-        "languages": ["python"], "max_points": 100,
-        "example": {"stdin": "OK\nFAIL\nFAIL\nOK\n", "expected_output": "2\n"},
-        "starter_code": {"python": "import sys\n\n# Leia as linhas de entrada e imprima a quantidade de FAIL.\nlinhas = sys.stdin.read().splitlines()\n\n"},
-        "tests": [
-            {"stdin": "FAIL\nOK\nFAIL\n", "expected_output": "2\n"},
-            {"stdin": "OK\nOK\n", "expected_output": "0\n"},
-            {"stdin": "FAIL\nFAIL\nFAIL\n", "expected_output": "3\n"},
-            {"stdin": "", "expected_output": "0\n"},
-            {"stdin": "fail\nFAILED\nFAIL\nOK\n", "expected_output": "1\n"},
-        ],
-    })
-    timestamp = now()
-    challenge = {
-        "owner_id": user["_id"], "title": "Demonstração: contagem de eventos FAIL",
-        "description": "Receba linhas pela entrada padrão. Conte apenas as linhas exatamente iguais a FAIL (maiúsculas) e imprima a quantidade. Entrada vazia deve resultar em 0. Este exercício serve para validar o editor e a correção automática.",
-        "deliverables": "Um programa Python que leia stdin e imprima um único número inteiro.",
-        "skills": ["Python", "Análise de logs"], "level": "Júnior", "work_mode": "Remoto",
-        "deadline": (timestamp + timedelta(days=30)).date().isoformat(), "status": "draft",
-        "is_recruitment": True, "authorization_confirmed": False,
-        "coding_enabled": True, "coding_max_points": 100, "created_at": timestamp, "updated_at": timestamp,
-    }
-    challenge["_id"] = mongo.db.challenges.insert_one(challenge).inserted_id
-    mongo.db.coding_configs.insert_one({**config, "challenge_id": challenge["_id"], "updated_at": timestamp})
-    return jsonify(serialize({"challenge": challenge})), 201
